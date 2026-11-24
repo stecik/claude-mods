@@ -17,6 +17,19 @@ const refreshBranch = async ($: EngineInterface): Promise<void> => {
   await update($, branch, () => name)
 }
 
+const place = atom({ plugin: 'usage-band', key: 'place' } as const, null)
+const remote = atom({ plugin: 'usage-band', key: 'remote' } as const, false)
+
+// Prostředí (local / ssh <host>) a název složky projektu
+const refreshPlace = async ($: EngineInterface): Promise<void> => {
+  const root = await $.session.root()
+  const folder = root.split(/[\\/]/).filter(Boolean).pop() ?? root
+  const isSsh = (await $.env.get('SSH_CONNECTION')) !== undefined
+  const host = (await $.env.get('HOSTNAME')) ?? (await $.env.get('COMPUTERNAME')) ?? 'remote'
+  const env = isSsh ? `ssh ${host}` : 'local'
+  await update($, place, () => ({ env, folder }))
+}
+
 const LABELS: Record<string, string> = {
   five_hour: '5h',
   seven_day: '7d',
@@ -77,6 +90,19 @@ const clampPercent = (percent: number): number => Math.max(0, Math.min(100, Math
 
 type Item = { key: string; label: string; percent: number; text: string }
 
+// Desktop kreslí SessionMode jako jeden řádek textu (bez Svg a mezer mezi Boxy),
+// proto ikony jako emoji
+const ICONS = { local: '💻', ssh: '🖧', folder: '📁', branch: '🌿', remote: '📱' }
+
+// Připojení klienti; víc než jeden = Remote Control (telefon nebo web) je připojený
+const clients = new Set<string>()
+
+const refreshRemote = async ($: EngineInterface): Promise<void> => {
+  const surfaces = await $.session.surfaces()
+  const isRemote = clients.size > 1 || surfaces.length > 1
+  await update($, remote, () => isRemote)
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const result = await next(e)
@@ -84,6 +110,22 @@ export const register: Register = on => {
     const value = await toUsage($, current.context, current.rateLimits)
     await update($, usage, () => value)
     await refreshBranch($)
+    await refreshPlace($)
+    await refreshRemote($)
+    return result
+  })
+
+  on('session.attach', async ($, e, next) => {
+    const result = await next(e)
+    clients.add(e.clientId)
+    await refreshRemote($)
+    return result
+  })
+
+  on('session.detach', async ($, e, next) => {
+    const result = await next(e)
+    clients.delete(e.clientId)
+    await refreshRemote($)
     return result
   })
 
@@ -94,21 +136,34 @@ export const register: Register = on => {
     return result
   })
 
-  // Neblokuje odeslání promptu
+  // Neblokuje odeslání promptu; /cd může změnit složku
   on('prompt.submit', ($, e, next) => {
     refreshBranch($).catch(() => undefined)
+    refreshPlace($).catch(() => undefined)
     return next(e)
   })
 
+  // Patička pod promptem: prostředí, složka, větev, Remote Control.
+  // Desktop kreslí jen SessionMode (PromptHint ne), proto vlastní strom tady
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
     const name = await read($, branch)
-    if (name === null) {
+    const where = await read($, place)
+    const isRemote = await read($, remote)
+    const parts = [
+      ...(where
+        ? [
+            where.env === 'local' ? ICONS.local : `${ICONS.ssh} ${where.env.replace(/^ssh /, '')}`,
+            `${ICONS.folder} ${where.folder}`,
+          ]
+        : []),
+      ...(name !== null ? [`${ICONS.branch} ${name}`] : []),
+      ...(isRemote ? [ICONS.remote] : []),
+    ]
+    if (parts.length === 0) {
       return next(e)
     }
-    // Vlastní strom místo přepsání modes: desktop přepsané modes nekreslí
     const { Text } = $.ui.resolve(e)
-    const labels = [...e.props.modes, `⎇ ${name}`].join(' & ')
-    return <Text dimColor>{labels}</Text>
+    return <Text dimColor>{parts.join('  ')}</Text>
   })
 
   // Engine posílá změny sám, není třeba pollovat
