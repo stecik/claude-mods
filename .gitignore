@@ -1,0 +1,4 @@
+# Typy a tsconfig generuje engine při načtení modu
+.claude-plugin/types/
+*/.claude-plugin/types/
+*/tsconfig.json

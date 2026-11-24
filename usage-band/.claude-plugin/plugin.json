@@ -1,0 +1,6 @@
+{
+  "name": "usage-band",
+  "version": "0.1.0",
+  "description": "Row above the prompt with context window fill and plan usage (5h / 7d limits).",
+  "types": "./types/index.d.ts"
+}
