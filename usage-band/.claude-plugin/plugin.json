@@ -1,6 +1,6 @@
 {
   "name": "usage-band",
-  "version": "0.2.0",
+  "version": "0.2.4",
   "description": "Row above the prompt with context window fill, plan usage (5h / 7d limits), prompt cache hit rate and TTL countdown, and estimated session cost.",
   "types": "./types/index.d.ts"
 }

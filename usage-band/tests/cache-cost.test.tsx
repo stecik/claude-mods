@@ -5,7 +5,15 @@ const BAND = {
   plugin: 'usage-band',
   component: 'AbovePrompt',
   surface: 'desktop',
-  props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 3, bodyColumns: 160 },
+  props: {
+    hasSurvey: false,
+    isCollapsed: false,
+    isWorking: false,
+    maxRows: 3,
+    bodyColumns: 160,
+    scroll: { offset: 0, bodyRows: 3 },
+    view: {},
+  },
 } as const
 
 const usageOf = (u: Partial<TurnUsage>): TurnUsage => ({
@@ -94,6 +102,61 @@ test('a limit over 70 % keeps its percent visible, dark on the amber fill', asyn
   const inner = await ui.find({ type: 'Text', text: /^87%$/ })
   expect(inner?.props.color).toBe('#1f1f1f')
   expect(await ui.find({ type: 'Text', text: /^3d 23h$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('band and footer draw at start even when no hook filled the state yet', async ($, on) => {
+  mock.clock(on, { now: 0 })
+  mock.store(on, { limits: [{ kind: 'seven_day', percentUsed: 40, resetsAt: new Date(3_600_000).toISOString() }] })
+  mock.env(on, {})
+  // Engine beneath: session.start ani session.measure neproběhly, jen dotazy na $ odpovídají
+  on('session.usage', () => ({
+    value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [], cost: { usd: 0 } },
+  }))
+  on('session.root', () => ({ value: 'C:\\work\\claude-mods' }))
+  on('vcs.detect', (_, e) => ({
+    vcs: 'git',
+    root: e.path,
+    mainRoot: e.path,
+    revision: '414fac2',
+    branch: 'main',
+    defaultBranch: 'main',
+    remote: null,
+  }))
+  on('session.surfaces', () => ({ value: ['desktop'] }))
+
+  const band = await $.ui.mount(BAND)
+  expect(await band.find({ type: 'Text', text: /^ctx$/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /^40%$/ })).toBeDefined()
+  await band.unmount()
+
+  const footer = await $.ui.mount({ plugin: 'usage-band', component: 'SessionMode', surface: 'desktop', props: { modes: [] } })
+  const text = (await footer.find({ type: 'Text' }))?.text ?? ''
+  expect(text.includes('claude-mods')).toBe(true)
+  expect(text.includes('main')).toBe(true)
+  await footer.unmount()
+})
+
+test('after a restart the cache item comes back from the store', async ($, on) => {
+  const now = 10 * 86_400_000
+  mock.clock(on, { now })
+  // Uloženo předchozím procesem téže session před 20 min; jiná session před 8 dny
+  mock.store(on, {
+    'cache:sess-1': { at: now - 1_200_000, ttl: '1h', read: 9_000, total: 10_000 },
+    'cache:old': { at: now - 8 * 86_400_000, ttl: '1h', read: 1, total: 2 },
+  })
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+
+  await $.session.measure({
+    context: { window: 1_000_000, tokens: 1_000, percent: 0 },
+    rateLimits: [],
+    changed: ['context'],
+  })
+
+  const ui = await $.ui.mount(BAND)
+  expect(await ui.find({ type: 'Text', text: /^90%$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^40m$/ })).toBeDefined()
   await ui.unmount()
 })
 

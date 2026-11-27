@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionContextUsage, SessionCost, SessionRateLimit, TurnUsage } from 'claude-code'
 
-import type { Cache, Limit, Usage } from '../types'
+import type { Cache, Limit, Place, Usage } from '../types'
 
 const usage = atom({ plugin: 'usage-band', key: 'usage' } as const, null)
 const cost = atom({ plugin: 'usage-band', key: 'cost' } as const, null)
@@ -29,16 +29,67 @@ const nextCache = (prev: Cache | null, u: TurnUsage, at: number): Cache => {
 }
 
 const TTL_MS = { '5m': 300_000, '1h': 3_600_000 } as const
+
+// $.state žije jen v procesu session: po restartu appky by hit rate a odpočet
+// zmizely do prvního requestu. Proto se cache drží i v $.store pod id session
+// (název transcriptu, stejný i po obnovení session)
+const CACHE_PREFIX = 'cache:'
+const STORED_CACHE_MAX_AGE_MS = 7 * 86_400_000
+
+const isCache = (v: unknown): v is Cache => {
+  if (typeof v !== 'object' || v === null) return false
+  const c = v as Partial<Cache>
+  return (
+    typeof c.at === 'number' &&
+    typeof c.read === 'number' &&
+    typeof c.total === 'number' &&
+    (c.ttl === null || c.ttl === '5m' || c.ttl === '1h')
+  )
+}
+
+const cacheKey = async ($: EngineInterface): Promise<string> => `${CACHE_PREFIX}${await $.session.id()}`
+
+// Záznamy session starší než týden pryč; jednou za kopii modulu
+let isPruned = false
+const pruneStoredCaches = async ($: EngineInterface): Promise<void> => {
+  if (isPruned) return
+  isPruned = true
+  const now = await $.clock.now()
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(CACHE_PREFIX)) continue
+    const value = await $.store.get(key)
+    if (!isCache(value) || now - value.at > STORED_CACHE_MAX_AGE_MS) {
+      await $.store.delete(key)
+    }
+  }
+}
+
+const loadStoredCache = async ($: EngineInterface): Promise<Cache | null> => {
+  await pruneStoredCaches($)
+  const value = await $.store.get(await cacheKey($))
+  return isCache(value) ? value : null
+}
+
+const restoreCache = async ($: EngineInterface): Promise<void> => {
+  if ((await read($, cache)) !== null) return
+  const stored = await loadStoredCache($)
+  if (stored !== null) {
+    await update($, cache, prev => prev ?? stored)
+  }
+}
 const branch = atom({ plugin: 'usage-band', key: 'branch' } as const, null)
 
 // Aktuální větev pracovní kopie; null mimo repozitář nebo při detached HEAD
-const refreshBranch = async ($: EngineInterface): Promise<void> => {
-  let name: string | null = null
+const computeBranch = async ($: EngineInterface): Promise<string | null> => {
   try {
-    name = (await $.vcs.detect({ path: '.' }))?.branch ?? null
+    return (await $.vcs.detect({ path: '.' }))?.branch ?? null
   } catch {
-    name = null
+    return null
   }
+}
+
+const refreshBranch = async ($: EngineInterface): Promise<void> => {
+  const name = await computeBranch($)
   await update($, branch, () => name)
 }
 
@@ -46,13 +97,18 @@ const place = atom({ plugin: 'usage-band', key: 'place' } as const, null)
 const remote = atom({ plugin: 'usage-band', key: 'remote' } as const, false)
 
 // Prostředí (local / ssh <host>) a název složky projektu
-const refreshPlace = async ($: EngineInterface): Promise<void> => {
+const computePlace = async ($: EngineInterface): Promise<Place> => {
   const root = await $.session.root()
   const folder = root.split(/[\\/]/).filter(Boolean).pop() ?? root
   const isSsh = (await $.env.get('SSH_CONNECTION')) !== undefined
   const host = (await $.env.get('HOSTNAME')) ?? (await $.env.get('COMPUTERNAME')) ?? 'remote'
   const env = isSsh ? `ssh ${host}` : 'local'
-  await update($, place, () => ({ env, folder }))
+  return { env, folder }
+}
+
+const refreshPlace = async ($: EngineInterface): Promise<void> => {
+  const value = await computePlace($)
+  await update($, place, () => value)
 }
 
 const LABELS: Record<string, string> = {
@@ -154,25 +210,48 @@ const refreshRemote = async ($: EngineInterface): Promise<void> => {
   await update($, remote, () => isRemote)
 }
 
+const refreshUsage = async ($: EngineInterface): Promise<void> => {
+  const current = await $.session.usage()
+  const value = await toUsage($, current.context, current.rateLimits)
+  await update($, usage, () => value)
+  await refreshCost($, current.cost)
+}
+
+// Odpočet cache se mění i bez událostí: překreslit pás každých 10 s.
+// Jeden časovač na kopii modulu (reload ho zastaví a register začne znovu)
+let isTicking = false
+const ensureTick = ($: EngineInterface): void => {
+  if (isTicking) return
+  isTicking = true
+  $.clock.every(10_000, () => $.ui.invalidate('ui.render'))
+}
+
+// Naplní celý stav; každý krok zvlášť, aby chyba jednoho nezastavila ostatní
+const refreshAll = async ($: EngineInterface): Promise<void> => {
+  ensureTick($)
+  const skip = (): undefined => undefined
+  await Promise.all([
+    refreshUsage($).catch(skip),
+    refreshBranch($).catch(skip),
+    refreshPlace($).catch(skip),
+    refreshRemote($).catch(skip),
+    restoreCache($).catch(skip),
+  ])
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const result = await next(e)
-    const current = await $.session.usage()
-    const value = await toUsage($, current.context, current.rateLimits)
-    await update($, usage, () => value)
-    await refreshCost($, current.cost)
-    // Odpočet cache se mění i bez událostí: překreslit pás každých 10 s
-    $.clock.every(10_000, () => $.ui.invalidate('ui.render'))
-    await refreshBranch($)
-    await refreshPlace($)
-    await refreshRemote($)
+    await refreshAll($)
     return result
   })
 
+  // Desktop připojí klienta až po startu session: stav naplnit (znovu) i tady,
+  // zápis do atomů pak překreslí nově připojený povrch
   on('session.attach', async ($, e, next) => {
     const result = await next(e)
     clients.add(e.clientId)
-    await refreshRemote($)
+    await refreshAll($)
     return result
   })
 
@@ -200,8 +279,10 @@ export const register: Register = on => {
   // Patička pod promptem: prostředí, složka, větev, Remote Control.
   // Desktop kreslí jen SessionMode (PromptHint ne), proto vlastní strom tady
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
-    const name = await read($, branch)
-    const where = await read($, place)
+    // Stav ještě nenaplněný (vykreslení před session.start / attach): spočítat na místě
+    const stored = await read($, place)
+    const where = stored ?? (await computePlace($).catch(() => null))
+    const name = stored !== null ? await read($, branch) : await computeBranch($)
     const isRemote = await read($, remote)
     const parts = [
       ...(where
@@ -235,19 +316,29 @@ export const register: Register = on => {
     const result = yield* next(e)
     const u = result.usage
     if (e.agentId === undefined && u !== null) {
-      await update($, cache, prev => nextCache(prev, u, at))
+      const prev = (await read($, cache)) ?? (await loadStoredCache($).catch(() => null))
+      const value = nextCache(prev, u, at)
+      await update($, cache, () => value)
+      await $.store.set(await cacheKey($), value).catch(() => undefined)
     }
     return result
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const value = await read($, usage)
-    if (e.props.hasSurvey || value === null) {
+    if (e.props.hasSurvey) {
+      return next(e)
+    }
+    // Stav ještě nenaplněný (vykreslení před session.start / attach): přečíst přímo,
+    // $.session.usage() bez breakdown nic nestojí
+    const stored = await read($, usage)
+    const current = stored === null ? await $.session.usage().catch(() => null) : null
+    const value = stored ?? (current !== null ? await toUsage($, current.context, current.rateLimits) : null)
+    if (value === null) {
       return next(e)
     }
 
-    const usd = await read($, cost)
-    const c = await read($, cache)
+    const usd = (await read($, cost)) ?? current?.cost?.usd ?? null
+    const c = (await read($, cache)) ?? (await loadStoredCache($).catch(() => null))
     const { Box, Text } = $.ui.resolve(e)
     const now = await $.clock.now()
     const hitRate = c !== null && c.total > 0 ? Math.round((c.read / c.total) * 100) : null
